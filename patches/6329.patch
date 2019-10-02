@@ -1,0 +1,577 @@
+From 15d1cce030f710f381661029ef917a66d1d8ff80 Mon Sep 17 00:00:00 2001
+From: Robert Braeutigam <robert@mathema.de>
+Date: Tue, 26 Feb 2019 14:22:07 +0100
+Subject: [PATCH 1/4] KAFKA-1194: Fix renaming open files on Windows
+
+---
+ .../main/scala/kafka/log/AbstractIndex.scala  | 53 ++++++++++++++-----
+ 1 file changed, 40 insertions(+), 13 deletions(-)
+
+diff --git a/core/src/main/scala/kafka/log/AbstractIndex.scala b/core/src/main/scala/kafka/log/AbstractIndex.scala
+index c69e78344d..1b2f2ffd5a 100644
+--- a/core/src/main/scala/kafka/log/AbstractIndex.scala
++++ b/core/src/main/scala/kafka/log/AbstractIndex.scala
+@@ -108,8 +108,20 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
+ 
+   protected val lock = new ReentrantLock
+ 
++  /**
++   * The maximum number of entries this index can hold
++   */
++  @volatile
++  private[this] var _maxEntries: Int = _
++
++  /** The number of entries in this index */
+   @volatile
+-  protected var mmap: MappedByteBuffer = {
++  protected var _entries: Int = _
++
++  @volatile
++  protected var mmap: MappedByteBuffer = _
++
++  protected def map() = {
+     val newlyCreated = file.createNewFile()
+     val raf = if (writable) new RandomAccessFile(file, "rw") else new RandomAccessFile(file, "r")
+     try {
+@@ -134,21 +146,17 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
+       else
+         // if this is a pre-existing index, assume it is valid and set position to last entry
+         idx.position(roundDownToExactMultiple(idx.limit(), entrySize))
+-      idx
++
++      // Set resulting mmap to instance variables
++      mmap = idx
++      _maxEntries = mmap.limit() / entrySize
++      _entries = mmap.position() / entrySize
+     } finally {
+       CoreUtils.swallow(raf.close(), AbstractIndex)
+     }
+   }
+ 
+-  /**
+-   * The maximum number of entries this index can hold
+-   */
+-  @volatile
+-  private[this] var _maxEntries = mmap.limit() / entrySize
+-
+-  /** The number of entries in this index */
+-  @volatile
+-  protected var _entries = mmap.position() / entrySize
++  map()
+ 
+   /**
+    * True iff there are no more slots available in this index
+@@ -203,8 +211,10 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
+    * @throws IOException if rename fails
+    */
+   def renameTo(f: File) {
+-    try Utils.atomicMoveWithFallback(file.toPath, f.toPath)
+-    finally file = f
++    maybeUnmapMap(lock) {
++      try Utils.atomicMoveWithFallback(file.toPath, f.toPath)
++      finally file = f
++    }
+   }
+ 
+   /**
+@@ -335,6 +345,23 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
+     }
+   }
+ 
++  /**
++   * Execute the given function in lock and with unmap/map for Windows. This
++   * is necessary because windows locks files, so for any structural operation on
++   * a file (rename, delete, move), it has to be unmapped first, then remapped.
++   */
++  protected def maybeUnmapMap[T](lock: Lock)(fun: => T): T = {
++    if (OperatingSystem.IS_WINDOWS) {
++      inLock(lock) {
++        safeForceUnmap();
++        try fun
++        finally map();
++      }
++    } else {
++      fun;
++    }
++  }
++
+   /**
+    * To parse an entry in the index.
+    *
+
+From 3eceb9ea1d96d545d1c60713ea40e1ce7b354dce Mon Sep 17 00:00:00 2001
+From: Robert Braeutigam <robert@mathema.de>
+Date: Thu, 28 Feb 2019 18:48:56 +0100
+Subject: [PATCH 2/4] KAFKA-1194: Change FileRecords to close channel before
+ rename on Windows
+
+---
+ .../common/record/FileLogInputStream.java     | 10 +-
+ .../kafka/common/record/FileRecords.java      | 93 +++++++++++++++----
+ 2 files changed, 78 insertions(+), 25 deletions(-)
+
+diff --git a/clients/src/main/java/org/apache/kafka/common/record/FileLogInputStream.java b/clients/src/main/java/org/apache/kafka/common/record/FileLogInputStream.java
+index 472c7a7ac3..cded5987cb 100644
+--- a/clients/src/main/java/org/apache/kafka/common/record/FileLogInputStream.java
++++ b/clients/src/main/java/org/apache/kafka/common/record/FileLogInputStream.java
+@@ -27,6 +27,7 @@
+ import java.nio.ByteBuffer;
+ import java.nio.channels.FileChannel;
+ import java.util.Iterator;
++import java.util.Objects;
+ 
+ import static org.apache.kafka.common.record.Records.LOG_OVERHEAD;
+ import static org.apache.kafka.common.record.Records.HEADER_SIZE_UP_TO_MAGIC;
+@@ -227,21 +228,16 @@ public boolean equals(Object o) {
+ 
+             FileChannelRecordBatch that = (FileChannelRecordBatch) o;
+ 
+-            FileChannel channel = fileRecords == null ? null : fileRecords.channel();
+-            FileChannel thatChannel = that.fileRecords == null ? null : that.fileRecords.channel();
+-
+             return offset == that.offset &&
+                     position == that.position &&
+                     batchSize == that.batchSize &&
+-                    (channel == null ? thatChannel == null : channel.equals(thatChannel));
++                    Objects.equals(fileRecords, that.fileRecords);
+         }
+ 
+         @Override
+         public int hashCode() {
+-            FileChannel channel = fileRecords == null ? null : fileRecords.channel();
+-
+             int result = (int) (offset ^ (offset >>> 32));
+-            result = 31 * result + (channel != null ? channel.hashCode() : 0);
++            result = 31 * result + (fileRecords != null ? fileRecords.hashCode() : 0);
+             result = 31 * result + position;
+             result = 31 * result + batchSize;
+             return result;
+diff --git a/clients/src/main/java/org/apache/kafka/common/record/FileRecords.java b/clients/src/main/java/org/apache/kafka/common/record/FileRecords.java
+index d723ba091b..d8339ab406 100644
+--- a/clients/src/main/java/org/apache/kafka/common/record/FileRecords.java
++++ b/clients/src/main/java/org/apache/kafka/common/record/FileRecords.java
+@@ -22,11 +22,13 @@
+ import org.apache.kafka.common.utils.AbstractIterator;
+ import org.apache.kafka.common.utils.Time;
+ import org.apache.kafka.common.utils.Utils;
++import org.apache.kafka.common.utils.OperatingSystem;
+ 
+ import java.io.Closeable;
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.RandomAccessFile;
++import java.io.UncheckedIOException;
+ import java.nio.ByteBuffer;
+ import java.nio.channels.FileChannel;
+ import java.nio.channels.GatheringByteChannel;
+@@ -41,6 +43,7 @@
+  * instance to enable slicing a range of the log records.
+  */
+ public class FileRecords extends AbstractRecords implements Closeable {
++    private final Object mutex = new Object();
+     private final boolean isSlice;
+     private final int start;
+     private final int end;
+@@ -49,8 +52,8 @@
+ 
+     // mutable state
+     private final AtomicInteger size;
+-    private final FileChannel channel;
+     private volatile File file;
++    private volatile FileChannel channel;
+ 
+     /**
+      * The {@code FileRecords.open} methods should be used instead of this constructor whenever possible.
+@@ -105,7 +108,21 @@ public File file() {
+      * @return The file channel
+      */
+     public FileChannel channel() {
+-        return channel;
++        if (OperatingSystem.IS_WINDOWS) {
++            synchronized (mutex) {
++                if (channel == null) {
++                    try {
++                        channel = FileChannel.open(file.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ,
++                                StandardOpenOption.WRITE);
++                    } catch (IOException e) {
++                        throw new UncheckedIOException(e);
++                    }
++                }
++                return channel;
++            }
++        } else {
++            return channel;
++        }
+     }
+ 
+     /**
+@@ -118,7 +135,7 @@ public FileChannel channel() {
+      * possible exceptions
+      */
+     public void readInto(ByteBuffer buffer, int position) throws IOException {
+-        Utils.readFully(channel, buffer, position + this.start);
++        Utils.readFully(channel(), buffer, position + this.start);
+         buffer.flip();
+     }
+ 
+@@ -146,7 +163,7 @@ public FileRecords slice(int position, int size) throws IOException {
+         // handle integer overflow or if end is beyond the end of the file
+         if (end < 0 || end >= start + sizeInBytes())
+             end = start + sizeInBytes();
+-        return new FileRecords(file, channel, this.start + position, end, true);
++        return new FileRecords(file, channel(), this.start + position, end, true);
+     }
+ 
+     /**
+@@ -161,7 +178,7 @@ public int append(MemoryRecords records) throws IOException {
+             throw new IllegalArgumentException("Append of size " + records.sizeInBytes() +
+                     " bytes is too large for segment with current file position at " + size.get());
+ 
+-        int written = records.writeFullyTo(channel);
++        int written = records.writeFullyTo(channel());
+         size.getAndAdd(written);
+         return written;
+     }
+@@ -170,7 +187,9 @@ public int append(MemoryRecords records) throws IOException {
+      * Commit all written data to the physical disk
+      */
+     public void flush() throws IOException {
+-        channel.force(true);
++        if (channel != null) {
++            channel.force(true);
++        }
+     }
+ 
+     /**
+@@ -179,14 +198,18 @@ public void flush() throws IOException {
+     public void close() throws IOException {
+         flush();
+         trim();
+-        channel.close();
++        if (channel != null) {
++            channel.close();
++        }
+     }
+ 
+     /**
+      * Close file handlers used by the FileChannel but don't write to disk. This is used when the disk may have failed
+      */
+     public void closeHandlers() throws IOException {
+-        channel.close();
++        if (channel != null) {
++            channel.close();
++        }
+     }
+ 
+     /**
+@@ -196,7 +219,9 @@ public void closeHandlers() throws IOException {
+      *          because it did not exist
+      */
+     public boolean deleteIfExists() throws IOException {
+-        Utils.closeQuietly(channel, "FileChannel");
++        if (channel != null) {
++            Utils.closeQuietly(channel, "FileChannel");
++        }
+         return Files.deleteIfExists(file.toPath());
+     }
+ 
+@@ -220,10 +245,25 @@ public void setFile(File file) {
+      * @throws IOException if rename fails.
+      */
+     public void renameTo(File f) throws IOException {
+-        try {
+-            Utils.atomicMoveWithFallback(file.toPath(), f.toPath());
+-        } finally {
+-            this.file = f;
++        if (OperatingSystem.IS_WINDOWS) {
++            synchronized (mutex) {
++                try {
++                    close();
++                    try {
++                        Utils.atomicMoveWithFallback(file.toPath(), f.toPath());
++                    } finally {
++                        this.file = f;
++                    }
++                } finally {
++                    channel = null;
++                }
++            }
++        } else {
++            try {
++                Utils.atomicMoveWithFallback(file.toPath(), f.toPath());
++            } finally {
++                this.file = f;
++            }
+         }
+     }
+ 
+@@ -242,8 +282,8 @@ public int truncateTo(int targetSize) throws IOException {
+         if (targetSize > originalSize || targetSize < 0)
+             throw new KafkaException("Attempt to truncate log segment " + file + " to " + targetSize + " bytes failed, " +
+                     " size of this log segment is " + originalSize + " bytes.");
+-        if (targetSize < (int) channel.size()) {
+-            channel.truncate(targetSize);
++        if (targetSize < (int) channel().size()) {
++            channel().truncate(targetSize);
+             size.set(targetSize);
+         }
+         return originalSize - targetSize;
+@@ -268,7 +308,7 @@ public int truncateTo(int targetSize) throws IOException {
+ 
+     @Override
+     public long writeTo(GatheringByteChannel destChannel, long offset, int length) throws IOException {
+-        long newSize = Math.min(channel.size(), end) - start;
++        long newSize = Math.min(channel().size(), end) - start;
+         int oldSize = sizeInBytes();
+         if (newSize < oldSize)
+             throw new KafkaException(String.format(
+@@ -280,9 +320,9 @@ public long writeTo(GatheringByteChannel destChannel, long offset, int length) t
+         final long bytesTransferred;
+         if (destChannel instanceof TransportLayer) {
+             TransportLayer tl = (TransportLayer) destChannel;
+-            bytesTransferred = tl.transferFrom(channel, position, count);
++            bytesTransferred = tl.transferFrom(channel(), position, count);
+         } else {
+-            bytesTransferred = channel.transferTo(position, count, destChannel);
++            bytesTransferred = channel().transferTo(position, count, destChannel);
+         }
+         return bytesTransferred;
+     }
+@@ -456,6 +496,23 @@ private static FileChannel openChannel(File file,
+         }
+     }
+ 
++    @Override
++    public int hashCode() {
++        return file.hashCode();
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (this == o)
++            return true;
++        if (o == null || getClass() != o.getClass())
++            return false;
++
++        FileRecords that = (FileRecords) o;
++
++        return file.equals(that.file);
++    }
++
+     public static class LogOffsetPosition {
+         public final long offset;
+         public final int position;
+
+From cab35c37f4ea043947d4cf38c564e007ec1ad079 Mon Sep 17 00:00:00 2001
+From: Robert Braeutigam <robert@mathema.de>
+Date: Thu, 28 Feb 2019 19:17:27 +0100
+Subject: [PATCH 3/4] KAFKA-1194: Keep AbstractIndex closed after rename on
+ Windows
+
+---
+ .../main/scala/kafka/log/AbstractIndex.scala  | 84 ++++++++++---------
+ .../unit/kafka/log/OffsetIndexTest.scala      |  4 +-
+ 2 files changed, 46 insertions(+), 42 deletions(-)
+
+diff --git a/core/src/main/scala/kafka/log/AbstractIndex.scala b/core/src/main/scala/kafka/log/AbstractIndex.scala
+index 1b2f2ffd5a..3f4f01fc3f 100644
+--- a/core/src/main/scala/kafka/log/AbstractIndex.scala
++++ b/core/src/main/scala/kafka/log/AbstractIndex.scala
+@@ -119,44 +119,49 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
+   protected var _entries: Int = _
+ 
+   @volatile
+-  protected var mmap: MappedByteBuffer = _
+-
+-  protected def map() = {
+-    val newlyCreated = file.createNewFile()
+-    val raf = if (writable) new RandomAccessFile(file, "rw") else new RandomAccessFile(file, "r")
+-    try {
+-      /* pre-allocate the file if necessary */
+-      if(newlyCreated) {
+-        if(maxIndexSize < entrySize)
+-          throw new IllegalArgumentException("Invalid max index size: " + maxIndexSize)
+-        raf.setLength(roundDownToExactMultiple(maxIndexSize, entrySize))
+-      }
++  protected var _mmap: MappedByteBuffer = _
+ 
+-      /* memory-map the file */
+-      _length = raf.length()
+-      val idx = {
+-        if (writable)
+-          raf.getChannel.map(FileChannel.MapMode.READ_WRITE, 0, _length)
+-        else
+-          raf.getChannel.map(FileChannel.MapMode.READ_ONLY, 0, _length)
++  protected def mmap(): MappedByteBuffer = {
++    maybeLock(lock) {
++      if (_mmap == null) {
++        val newlyCreated = file.createNewFile()
++        val raf = if (writable) new RandomAccessFile(file, "rw") else new RandomAccessFile(file, "r")
++        try {
++          /* pre-allocate the file if necessary */
++          if(newlyCreated) {
++            if(maxIndexSize < entrySize)
++              throw new IllegalArgumentException("Invalid max index size: " + maxIndexSize)
++            raf.setLength(roundDownToExactMultiple(maxIndexSize, entrySize))
++          }
++
++          /* memory-map the file */
++          _length = raf.length()
++          val idx = {
++            if (writable)
++              raf.getChannel.map(FileChannel.MapMode.READ_WRITE, 0, _length)
++            else
++              raf.getChannel.map(FileChannel.MapMode.READ_ONLY, 0, _length)
++          }
++          /* set the position in the index for the next entry */
++          if(newlyCreated)
++            idx.position(0)
++          else
++            // if this is a pre-existing index, assume it is valid and set position to last entry
++            idx.position(roundDownToExactMultiple(idx.limit(), entrySize))
++
++          // Set resulting mmap to instance variables
++          _mmap = idx
++          _maxEntries = _mmap.limit() / entrySize
++          _entries = _mmap.position() / entrySize
++        } finally {
++          CoreUtils.swallow(raf.close(), AbstractIndex)
++        }
+       }
+-      /* set the position in the index for the next entry */
+-      if(newlyCreated)
+-        idx.position(0)
+-      else
+-        // if this is a pre-existing index, assume it is valid and set position to last entry
+-        idx.position(roundDownToExactMultiple(idx.limit(), entrySize))
+-
+-      // Set resulting mmap to instance variables
+-      mmap = idx
+-      _maxEntries = mmap.limit() / entrySize
+-      _entries = mmap.position() / entrySize
+-    } finally {
+-      CoreUtils.swallow(raf.close(), AbstractIndex)
++      return _mmap;
+     }
+   }
+ 
+-  map()
++  mmap() // Initialize
+ 
+   /**
+    * True iff there are no more slots available in this index
+@@ -194,9 +199,9 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
+             safeForceUnmap()
+           raf.setLength(roundedNewSize)
+           _length = roundedNewSize
+-          mmap = raf.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, roundedNewSize)
++          _mmap = raf.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, roundedNewSize)
+           _maxEntries = mmap.limit() / entrySize
+-          mmap.position(position)
++          _mmap.position(position)
+           true
+         } finally {
+           CoreUtils.swallow(raf.close(), AbstractIndex)
+@@ -211,7 +216,7 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
+    * @throws IOException if rename fails
+    */
+   def renameTo(f: File) {
+-    maybeUnmapMap(lock) {
++    maybeUnmap(lock) {
+       try Utils.atomicMoveWithFallback(file.toPath, f.toPath)
+       finally file = f
+     }
+@@ -327,7 +332,7 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
+    */
+   protected[log] def forceUnmap() {
+     try MappedByteBuffers.unmap(file.getAbsolutePath, mmap)
+-    finally mmap = null // Accessing unmapped mmap crashes JVM by SEGV so we null it out to be safe
++    finally _mmap = null // Accessing unmapped mmap crashes JVM by SEGV so we null it out to be safe
+   }
+ 
+   /**
+@@ -350,12 +355,11 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
+    * is necessary because windows locks files, so for any structural operation on
+    * a file (rename, delete, move), it has to be unmapped first, then remapped.
+    */
+-  protected def maybeUnmapMap[T](lock: Lock)(fun: => T): T = {
++  protected def maybeUnmap[T](lock: Lock)(fun: => T): T = {
+     if (OperatingSystem.IS_WINDOWS) {
+       inLock(lock) {
+         safeForceUnmap();
+-        try fun
+-        finally map();
++        fun
+       }
+     } else {
+       fun;
+diff --git a/core/src/test/scala/unit/kafka/log/OffsetIndexTest.scala b/core/src/test/scala/unit/kafka/log/OffsetIndexTest.scala
+index 4e2ab2faf6..2d52a599fc 100644
+--- a/core/src/test/scala/unit/kafka/log/OffsetIndexTest.scala
++++ b/core/src/test/scala/unit/kafka/log/OffsetIndexTest.scala
+@@ -188,8 +188,8 @@ class OffsetIndexTest extends JUnitSuite {
+   def forceUnmapTest(): Unit = {
+     val idx = new OffsetIndex(nonExistentTempFile(), baseOffset = 0L, maxIndexSize = 10 * 8)
+     idx.forceUnmap()
+-    // mmap should be null after unmap causing lookup to throw a NPE
+-    intercept[NullPointerException](idx.lookup(1))
++    // mmap should be null after unmap, but mmap() remaps it, so this should not throw any exception
++    idx.lookup(1)
+   }
+ 
+   @Test
+
+From 9984478960fa38b231d68e4b96ecbe6d325a50da Mon Sep 17 00:00:00 2001
+From: Robert Braeutigam <robert@mathema.de>
+Date: Mon, 4 Mar 2019 15:46:46 +0100
+Subject: [PATCH 4/4] KAFKA-1194: Synchronize deletes with renames on Windows
+
+---
+ .../apache/kafka/common/record/FileRecords.java   | 15 ++++++++++++---
+ core/src/main/scala/kafka/log/AbstractIndex.scala |  6 ++++--
+ 2 files changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/clients/src/main/java/org/apache/kafka/common/record/FileRecords.java b/clients/src/main/java/org/apache/kafka/common/record/FileRecords.java
+index d8339ab406..481bacfa3f 100644
+--- a/clients/src/main/java/org/apache/kafka/common/record/FileRecords.java
++++ b/clients/src/main/java/org/apache/kafka/common/record/FileRecords.java
+@@ -219,10 +219,19 @@ public void closeHandlers() throws IOException {
+      *          because it did not exist
+      */
+     public boolean deleteIfExists() throws IOException {
+-        if (channel != null) {
+-            Utils.closeQuietly(channel, "FileChannel");
++        if (OperatingSystem.IS_WINDOWS) {
++            synchronized (mutex) {
++                if (channel != null) {
++                    Utils.closeQuietly(channel, "FileChannel");
++                }
++                return Files.deleteIfExists(file.toPath());
++            }
++        } else {
++            if (channel != null) {
++                Utils.closeQuietly(channel, "FileChannel");
++            }
++            return Files.deleteIfExists(file.toPath());
+         }
+-        return Files.deleteIfExists(file.toPath());
+     }
+ 
+     /**
+diff --git a/core/src/main/scala/kafka/log/AbstractIndex.scala b/core/src/main/scala/kafka/log/AbstractIndex.scala
+index 3f4f01fc3f..634763f039 100644
+--- a/core/src/main/scala/kafka/log/AbstractIndex.scala
++++ b/core/src/main/scala/kafka/log/AbstractIndex.scala
+@@ -239,8 +239,10 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
+    *         not exist
+    */
+   def deleteIfExists(): Boolean = {
+-    closeHandler()
+-    Files.deleteIfExists(file.toPath)
++    maybeLock(lock) {
++      closeHandler()
++      Files.deleteIfExists(file.toPath)
++    };
+   }
+ 
+   /**
